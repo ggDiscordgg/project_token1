@@ -1,27 +1,29 @@
 const express = require('express');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const mongoose = require('mongoose');
-const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
 const port = 3000;
 
-// اتصال 
-console.log(process.env.MONGO_URI)
+// اتصال MongoDB
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     .then(() => console.log("✅ Connected to MongoDB"))
     .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
 // نماذج البيانات
-const ServerSchema = new mongoose.Schema({ serverId: String, serverName: String, description: String, ownerId: String, isFeatured: Boolean });
+const ServerSchema = new mongoose.Schema({
+    serverId: String, 
+    serverName: String, 
+    description: String, 
+    ownerId: String, 
+    lastShared: Date,
+    isFeatured: Boolean 
+});
 const Server = mongoose.model('Server', ServerSchema);
 
 const ReportSchema = new mongoose.Schema({ serverId: String, reason: String, reporterId: String });
 const Report = mongoose.model('Report', ReportSchema);
-
-const SuggestionSchema = new mongoose.Schema({ userId: String, suggestion: String, timestamp: Date });
-const Suggestion = mongoose.model('Suggestion', SuggestionSchema);
 
 // إعداد البوت
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -36,8 +38,6 @@ const commands = [
         .addStringOption(option => option.setName('name').setDescription('اسم السيرفر').setRequired(true))
         .addStringOption(option => option.setName('description').setDescription('وصف السيرفر').setRequired(true)),
 
-    new SlashCommandBuilder().setName('featured').setDescription('أضف سيرفرك إلى قائمة السيرفرات المميزة'),
-
     new SlashCommandBuilder().setName('listservers').setDescription('اعرض قائمة السيرفرات المسجلة'),
 
     new SlashCommandBuilder().setName('report').setDescription('إبلاغ عن سيرفر مخالف')
@@ -46,10 +46,7 @@ const commands = [
 
     new SlashCommandBuilder().setName('stats').setDescription('عرض إحصائيات السيرفر'),
 
-    new SlashCommandBuilder().setName('randomserver').setDescription('اقتراح سيرفر عشوائي'),
-
-    new SlashCommandBuilder().setName('suggest').setDescription('إرسال اقتراح لتحسين السيرفر أو البوت')
-        .addStringOption(option => option.setName('idea').setDescription('اكتب اقتراحك هنا').setRequired(true))
+    new SlashCommandBuilder().setName('share').setDescription('مشاركة سيرفرك مع الآخرين').addStringOption(option => option.setName('channel').setDescription('اسم القناة التي تود نشر السيرفر فيها').setRequired(true))
 ].map(command => command.toJSON());
 
 // نشر الأوامر
@@ -68,6 +65,7 @@ const rest = new REST({ version: '9' }).setToken(process.env.BOT_TOKEN);
 client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
 
+    // التحقق من أن المستخدم هو مالك البوت أو الأونر فقط
     if (interaction.commandName === 'setserver') {
         const serverName = interaction.options.getString('name');
         const description = interaction.options.getString('description');
@@ -78,97 +76,88 @@ client.on('interactionCreate', async interaction => {
             existingServer.description = description;
             await existingServer.save();
         } else {
-            const newServer = new Server({ serverId: interaction.guild.id, serverName, description, ownerId: interaction.user.id });
+            const newServer = new Server({ serverId: interaction.guild.id, serverName, description, ownerId: interaction.user.id, lastShared: new Date() });
             await newServer.save();
         }
         await interaction.reply({ content: `✅ سيرفرك **${serverName}** تم تسجيله!`, ephemeral: true });
     }
 
-    if (interaction.commandName === 'featured') {
-        const server = await Server.findOne({ serverId: interaction.guild.id });
-        if (!server) return interaction.reply({ content: '❌ سيرفرك غير مسجل! استخدم /setserver أولًا.', ephemeral: true });
+    // تنفيذ أمر share
+    if (interaction.commandName === 'share') {
+        const channelName = interaction.options.getString('channel');
+        const existingServer = await Server.findOne({ serverId: interaction.guild.id });
 
-        server.isFeatured = true;
-        await server.save();
-        interaction.reply({ content: `✅ سيرفرك **${server.serverName}** أصبح مميزًا!`, ephemeral: true });
+        // تحقق من وجود السيرفر في قاعدة البيانات
+        if (!existingServer) {
+            return interaction.reply({ content: '❌ لم يتم تسجيل سيرفرك بعد!', ephemeral: true });
+        }
+
+        // تحقق من الوقت الفعلي لنشر السيرفر
+        const now = new Date();
+        const timeDiff = now - existingServer.lastShared; // الفرق بين الوقت الحالي وآخر وقت نشر
+
+        // إذا كانت الفترة أقل من 3 ساعات
+        if (timeDiff < 3 * 60 * 60 * 1000) {
+            const remainingTime = (3 * 60 * 60 * 1000 - timeDiff) / 1000; // الوقت المتبقي بالثواني
+            return interaction.reply({ content: `❌ لا يمكنك نشر سيرفرك الآن. يمكنك المحاولة بعد ${Math.floor(remainingTime / 60)} دقيقة(s).`, ephemeral: true });
+        }
+
+        // نشر السيرفر في القناة المحددة
+        const guild = client.guilds.cache.get(interaction.guild.id);
+        if (!guild) {
+            return interaction.reply({ content: '❌ لم أتمكن من العثور على السيرفر!', ephemeral: true });
+        }
+
+        const channel = guild.channels.cache.find(ch => ch.name === channelName);
+        if (!channel) {
+            return interaction.reply({ content: '❌ لم أتمكن من العثور على القناة المحددة!', ephemeral: true });
+        }
+
+        // تحقق إذا كانت القناة مفتوحة
+        if (channel.permissionsFor(guild.members.me).has('SEND_MESSAGES') === false) {
+            return interaction.reply({ content: '❌ القناة مغلقة. يرجى فتحها ليتم نشر السيرفر.', ephemeral: true });
+        }
+
+        // إرسال رسالة في القناة
+        await channel.send(`🚀 **سيرفر جديد: ${existingServer.serverName}**\n${existingServer.description}\n🖱️ انضم عبر هذا الرابط: <رابط السيرفر>`);
+
+        // الحصول على سيرفر عشوائي
+        const randomServer = await Server.aggregate([{ $sample: { size: 1 } }]);
+        const randomServerData = randomServer[0];
+        if (randomServerData) {
+            await channel.send(`💥 **سيرفر عشوائي:**\n**${randomServerData.serverName}**\n${randomServerData.description}\n🖱️ انضم عبر هذا الرابط: <رابط السيرفر العشوائي>`);
+        }
+
+        // تحديث وقت آخر نشر
+        existingServer.lastShared = new Date();
+        await existingServer.save();
+
+        interaction.reply({ content: `✅ تم نشر سيرفرك بنجاح في القناة ${channelName}!`, ephemeral: true });
     }
 
-    if (interaction.commandName === 'listservers') {
-        const servers = await Server.find();
-        if (servers.length === 0) return interaction.reply({ content: '❌ لا يوجد سيرفرات مسجلة حتى الآن.', ephemeral: true });
-
-        let response = '📌 **قائمة السيرفرات:**\n\n';
-        servers.forEach(server => response += `🔹 **${server.serverName}** - ${server.description}\n`);
-        interaction.reply({ content: response, ephemeral: false });
-    }
-
+    // تنفيذ أمر البلاغ
     if (interaction.commandName === 'report') {
         const serverId = interaction.options.getString('server_id');
         const reason = interaction.options.getString('reason');
 
         const report = new Report({ serverId, reason, reporterId: interaction.user.id });
         await report.save();
-        interaction.reply({ content: '✅ تم إرسال الإبلاغ بنجاح!', ephemeral: true });
-    }
 
-    if (interaction.commandName === 'stats') {
-        const guild = interaction.guild;
-        const stats = `📊 **إحصائيات سيرفرك:**\n👥 الأعضاء: ${guild.memberCount}\n📢 القنوات: ${guild.channels.cache.size}\n🎭 الأدوار: ${guild.roles.cache.size}`;
-        interaction.reply({ content: stats, ephemeral: false });
-    }
-
-    if (interaction.commandName === 'randomserver') {
-        const servers = await Server.find();
-        if (servers.length === 0) return interaction.reply({ content: '❌ لا يوجد سيرفرات متاحة.', ephemeral: true });
-
-        const randomServer = servers[Math.floor(Math.random() * servers.length)];
-        interaction.reply({ content: `🔹 **${randomServer.serverName}** - ${randomServer.description}`, ephemeral: false });
-    }
-
-    if (interaction.commandName === 'suggest') {
-        const idea = interaction.options.getString('idea');
-
-        const newSuggestion = new Suggestion({ userId: interaction.user.id, suggestion: idea, timestamp: new Date() });
-        await newSuggestion.save();
-
-        const suggestionChannel = interaction.guild.channels.cache.find(ch => ch.name === 'suggestions');
-        if (suggestionChannel) {
-            suggestionChannel.send(`💡 **اقتراح جديد من ${interaction.user.tag}:**\n${idea}`);
+        // العثور على القناة الخاصة بالسيرفر بناءً على `serverId`
+        const guild = client.guilds.cache.get(serverId);
+        if (guild) {
+            const reportChannel = guild.channels.cache.find(ch => ch.name === 'reports'); // هنا يتم التوجيه إلى قناة "reports"
+            if (reportChannel) {
+                reportChannel.send(`🚨 **بلاغ جديد عن سيرفر ${guild.name}:**\nسبب البلاغ: ${reason}\n📩 بواسطة: ${interaction.user.tag}`);
+            }
         }
 
-        interaction.reply({ content: '✅ تم إرسال اقتراحك بنجاح!', ephemeral: true });
+        interaction.reply({ content: '✅ تم إرسال الإبلاغ بنجاح!', ephemeral: true });
     }
 });
 
 // تسجيل الدخول
 client.login(process.env.BOT_TOKEN);
-
-// واجهة تسجيل الدخول عبر Discord OAuth2
-app.get('/login', (req, res) => {
-    const authUrl = `https://discord.com/oauth2/authorize?client_id=${process.env.CLIENT_ID}&redirect_uri=${encodeURIComponent(process.env.REDIRECT_URI)}&response_type=code&scope=identify+guilds`;
-    res.redirect(authUrl);
-});
-
-app.get('/callback', async (req, res) => {
-    const code = req.query.code;
-
-    try {
-        const response = await axios.post('https://discord.com/api/oauth2/token', null, {
-            params: {
-                client_id: process.env.CLIENT_ID,
-                client_secret: process.env.CLIENT_SECRET,
-                code,
-                grant_type: 'authorization_code',
-                redirect_uri: process.env.REDIRECT_URI,
-                scope: 'identify guilds'
-            }
-        });
-
-        res.send(`<h1>✅ Login Successful!</h1><p>Now you can manage your server.</p>`);
-    } catch (error) {
-        res.send('❌ Error during authentication');
-    }
-});
 
 // تشغيل السيرفر
 app.listen(port, () => console.log(`🚀 Server running at http://localhost:${port}`));

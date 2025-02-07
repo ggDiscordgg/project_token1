@@ -157,7 +157,7 @@ client.on('interactionCreate', async interaction => {
 });
 
 // تسجيل الدخول
-client.login(process.env.BOT_TOKEN);
+client.login(process.env.BOT_TOKEN);  
 
 // تشغيل السيرفر
 app.listen(port, () => console.log(`🚀 Server running at http://localhost:${port}`));
